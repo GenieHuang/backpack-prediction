@@ -1,0 +1,4 @@
+ensemble = 'RMSE: 38.89976100504989'
+xgboost = 'RMSE: 38.9054577605082'
+ensemble_pca = 'RMSE: 38.92281273960683'
+catboost = 'RMSE: 38.89703379024771'
