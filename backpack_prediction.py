@@ -13,7 +13,7 @@ from sklearn.ensemble import VotingRegressor
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestRegressor
 from catboost import CatBoostRegressor
-from cuml.preprocessing import TargetEncoder
+import category_encoders as ce
 import optuna
 
 sns.set(style="whitegrid", font_scale=1.2)
@@ -109,10 +109,10 @@ def one_hot(test_df, encoder):
 
 # Target Encoding
 def target_encode(X, y):
-    for col in nominal_columns:
-        mean_encoded = X.groupby(col)[y].mean()
-        X[col] = X[col].map(mean_encoded)
-    return X
+    encoder = ce.TargetEncoder(cols=categorical_columns)
+    X_encoded = encoder.fit_transform(X, y)
+
+    return X_encoded, encoder
 
 
 # PCA   
@@ -219,42 +219,65 @@ def xgboost_model(X_train, y_train, X_test, params=None):
     # Make predictions
     y_test_pred = model.predict(X_test, iteration_range=(0, model.best_iteration))
     
-    return y_test_pred
+    return y_test_pred, model
 
 
 # Ensemble Model
-def ensemble_model(X_train, y_train, X_test, params=None):
-    if params is None:
-        params = {
-            'n_estimators': 100,
-            'max_depth': None,
-            'min_samples_split': 2,
-            'min_samples_leaf': 1,
-            'random_state': 42
-        }
+def ensemble_model(X_train, y_train, X_test, params):
+
+    final_models = []
+    for i in range(3):
+        model = XGBRegressor(**params[f"model_{i}"])
+        model.fit(X_train, y_train)
+        final_models.append(model)
+
+    weights = best_params["weights"]
+    y_test_pred = np.zeros(len(X_test))
+    for i, model in enumerate(final_models):
+        y_test_pred += weights[i] * model.predict(X_test)
     
-    params2 = params.copy()
-    params2['max_depth'] = params['max_depth'] + 1
+    return y_test_pred, final_models
 
-    params3 = params.copy()
-    params3['learning_rate'] = params['learning_rate'] * 0.8
 
-    model1 = XGBRegressor(**params)
-    model2 = XGBRegressor(**params2)
-    model3 = XGBRegressor(**params3)
-
-    ensemble = VotingRegressor([
-        ('m1', model1),
-        ('m2', model2),
-        ('m3', model3)
-    ])  
-
-    ensemble.fit(X_train, y_train)
-
-    # Make predictions
-    y_test_pred = ensemble.predict(X_test)
+def predict_with_ensemble(final_models, weights, X_test):
     
-    return y_test_pred
+    weights = np.array(weights)
+    weights = weights / np.sum(weights)
+    
+    preds = np.zeros(len(X_test))
+    
+    for i, model in enumerate(final_models):
+        model_preds = model.predict(X_test)
+        preds += weights[i] * model_preds
+    
+    return preds
+
+
+def process_params(best_params):
+    processed_params = {}
+    
+    if any(k.startswith("model0_") for k in best_params.keys()):
+        for i in range(3):
+            model_prefix = f"model{i}_"
+            processed_params[f"model_{i}"] = {
+                k.replace(model_prefix, ""): v 
+                for k, v in best_params.items() 
+                if k.startswith(model_prefix)
+            }
+        
+        weights = [
+            best_params.get(f"weight{i}", 1.0) for i in range(3)
+        ]
+        
+        if "weights" in best_params:
+            weights = best_params["weights"]
+        else:
+            weights = [1.0, 1.0, 1.0]
+    
+    total_weight = sum(weights)
+    processed_params["weights"] = [w / total_weight for w in weights]
+    
+    return processed_params
 
 
 # Find best hyperparameters for CatBoost
@@ -299,6 +322,89 @@ def tune_hyperparameters(X_train, y_train,n_trials=20):
     return study.best_trial.params
 
 
+def ensemble_tune_hyperparameters(X_train, y_train, n_trials=20):
+    def objective(trial):
+
+        models_params = []
+        for i in range(3):
+            params = {
+                "n_estimators": trial.suggest_int(f"model{i}_n_estimators", 100, 1000),
+                "max_depth": trial.suggest_int(f"model{i}_max_depth", 3, 10),
+                "learning_rate": trial.suggest_float(f"model{i}_learning_rate", 0.01, 0.3, log=True),
+                "subsample": trial.suggest_float(f"model{i}_subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float(f"model{i}_colsample_bytree", 0.5, 1.0),
+                "min_child_weight": trial.suggest_int(f"model{i}_min_child_weight", 1, 10),
+                "gamma": trial.suggest_float(f"model{i}_gamma", 0, 1),
+                "reg_alpha": trial.suggest_float(f"model{i}_reg_alpha", 0, 1),
+                "reg_lambda": trial.suggest_float(f"model{i}_reg_lambda", 0, 1),
+                "random_state": 42
+            }
+            models_params.append(params)
+        
+
+        weights = [
+            trial.suggest_float("weight0", 0.1, 1.0),
+            trial.suggest_float("weight1", 0.1, 1.0),
+            trial.suggest_float("weight2", 0.1, 1.0)
+        ]
+
+        sum_weights = sum(weights)
+        weights = [w/sum_weights for w in weights]
+        
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        scores = []
+        
+        for train_idx, valid_idx in kf.split(X_train):
+            X_train_kf = X_train.iloc[train_idx]
+            y_train_kf = y_train.iloc[train_idx]
+            X_val_kf = X_train.iloc[valid_idx]
+            y_val_kf = y_train.iloc[valid_idx]
+            
+
+            models = []
+            for i in range(3):
+                model = XGBRegressor(**models_params[i])
+                model.fit(
+                    X_train_kf, y_train_kf,
+                    eval_set=[(X_val_kf, y_val_kf)],
+                    verbose=0
+)
+                models.append(model)
+            
+
+            ensemble_preds = np.zeros(len(y_val_kf))
+            for i, model in enumerate(models):
+                preds = model.predict(X_val_kf)
+                ensemble_preds += weights[i] * preds
+            
+
+            rmse = np.sqrt(mean_squared_error(y_val_kf, ensemble_preds))
+            scores.append(rmse)
+        
+        return np.mean(scores)
+    
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=n_trials)
+    
+
+    best_params = {
+        "model_0": {k.replace("model0_", ""): v for k, v in study.best_params.items() if k.startswith("model0_")},
+        "model_1": {k.replace("model1_", ""): v for k, v in study.best_params.items() if k.startswith("model1_")},
+        "model_2": {k.replace("model2_", ""): v for k, v in study.best_params.items() if k.startswith("model2_")},
+        "weights": [
+            study.best_params["weight0"],
+            study.best_params["weight1"],
+            study.best_params["weight2"]
+        ]
+    }
+    
+
+    sum_weights = sum(best_params["weights"])
+    best_params["weights"] = [w/sum_weights for w in best_params["weights"]]
+    
+    return best_params
+
+
 # Catboost Model
 def catboost_model(X_train, y_train, X_test, y_test, params):
 
@@ -329,7 +435,8 @@ y = train_df_handled[target_column]
 # X_encoded, ohe, oh_encoded = one_hot_encoder(X)
 # test_df_encoded = one_hot(test_df_handled, ohe)
 
-X_encoded = target_encode(X, y)
+X_encoded, target_encoder = target_encode(X, y)
+test_df_encoded = target_encoder.transform(test_df_handled)
 
 # print(X_encoded)
 
@@ -340,9 +447,6 @@ X_train, X_test, y_train, y_test = train_test_split(X_encoded, y, test_size=0.2,
 
 
 #############################Model######################################
-# print("原始One-Hot编码特征数:", oh_encoded.shape[1])
-# print("PCA降维后特征数:", pca_features.shape[1])
-# print("解释方差比:", sum(pca.explained_variance_ratio_))
 
 
 # best_params, _ = random_search(X_train, y_train)
@@ -361,19 +465,31 @@ X_train, X_test, y_train, y_test = train_test_split(X_encoded, y, test_size=0.2,
 # catboost_best_params = tune_hyperparameters(X_train, y_train)
 # print("Best CatBoost Hyperparameters:", catboost_best_params)
 
-catboost_best_params = {'iterations': 1168, 
-     'depth': 3, 
-     'learning_rate': 0.09617371243696217, 
-     'l2_leaf_reg': 0.3327534768702417, 
-     'random_strength': 0.9282015330678425, 
-     'bagging_temperature': 0.7102677755287592, 
-     'border_count': 142}
+# catboost_best_params= {'iterations': 1352, 
+#                        'depth': 5, 
+#                        'learning_rate': 0.022450500385312554, 
+#                        'l2_leaf_reg': 0.4284227228311264, 
+#                        'random_strength': 0.12546850412679345, 
+#                        'bagging_temperature': 0.8198063284866197, 
+#                        'border_count': 183}
 
-y_test_pred, cat_model= catboost_model(X_train, y_train, X_test, y_test, catboost_best_params)
+# catboost_best_params = {'iterations': 1168, 
+#      'depth': 3, 
+#      'learning_rate': 0.09617371243696217, 
+#      'l2_leaf_reg': 0.3327534768702417, 
+#      'random_strength': 0.9282015330678425, 
+#      'bagging_temperature': 0.7102677755287592, 
+#      'border_count': 142}
 
-# y_test_pred = ensemble_model(X_train, y_train, X_test, best_params)
+# y_test_pred, cat_model= catboost_model(X_train, y_train, X_test, y_test, catboost_best_params)
+# best_params = ensemble_tune_hyperparameters(X_train, y_train)
 
-# y_test_pred = xgboost_model(X_train, y_train, X_test, best_params)
+# best_params = {'model0_n_estimators': 252, 'model0_max_depth': 4, 'model0_learning_rate': 0.015143071414466724, 'model0_subsample': 0.8315345012418895, 'model0_colsample_bytree': 0.9644124617433968, 'model0_min_child_weight': 10, 'model0_gamma': 0.35216662983084956, 'model0_reg_alpha': 0.3105605677930154, 'model0_reg_lambda': 0.3547394710233012, 'model1_n_estimators': 557, 'model1_max_depth': 5, 'model1_learning_rate': 0.018331021449155598, 'model1_subsample': 0.7147085715855364, 'model1_colsample_bytree': 0.598194303762557, 'model1_min_child_weight': 8, 'model1_gamma': 0.7198936027399416, 'model1_reg_alpha': 0.6571128147750868, 'model1_reg_lambda': 0.6575855790717202, 'model2_n_estimators': 108, 'model2_max_depth': 9, 'model2_learning_rate': 0.021302419448423867, 'model2_subsample': 0.8992953092810227, 'model2_colsample_bytree': 0.6908558820353785, 'model2_min_child_weight': 9, 'model2_gamma': 0.8630403601869322, 'model2_reg_alpha': 0.49782641380343207, 'model2_reg_lambda': 0.031067778380564744, 'weight0': 0.8866750402055176, 'weight1': 0.5023241180485698, 'weight2': 0.666289954575352}
+best_params = {'model0_n_estimators': 106, 'model0_max_depth': 3, 'model0_learning_rate': 0.03187905158741838, 'model0_subsample': 0.6763571582186845, 'model0_colsample_bytree': 0.9701448228171785, 'model0_min_child_weight': 7, 'model0_gamma': 0.3770878959183077, 'model0_reg_alpha': 0.7031272356524338, 'model0_reg_lambda': 0.21570348043226606, 'model1_n_estimators': 708, 'model1_max_depth': 3, 'model1_learning_rate': 0.07213387746367997, 'model1_subsample': 0.7066344693160838, 'model1_colsample_bytree': 0.6646023302345823, 'model1_min_child_weight': 3, 'model1_gamma': 0.16519992714604143, 'model1_reg_alpha': 0.9960020826994176, 'model1_reg_lambda': 0.2778732606529881, 'model2_n_estimators': 105, 'model2_max_depth': 7, 'model2_learning_rate': 0.018262010536530184, 'model2_subsample': 0.5061719940590499, 'model2_colsample_bytree': 0.6674518957827519, 'model2_min_child_weight': 6, 'model2_gamma': 0.7209954939624005, 'model2_reg_alpha': 0.503750496545143, 'model2_reg_lambda': 0.13426464968535673, 'weight0': 0.9992266581985025, 'weight1': 0.9822164895272267, 'weight2': 0.18676014421800924}
+best_params = process_params(best_params)
+y_test_pred, ensemble = ensemble_model(X_train, y_train, X_test, best_params)
+
+# y_test_pred, xg_model= xgboost_model(X_train, y_train, X_test, best_params)
 
 # y_test_pred = random_forest(X_train, y_train, X_test)
 
@@ -382,7 +498,9 @@ y_test_pred, cat_model= catboost_model(X_train, y_train, X_test, y_test, catboos
 print(f"RMSE: {rmse(y_test, y_test_pred)}")
 ############################################################
 # Prediction on test data
-final_predictions = cat_model.predict(test_df_encoded)
+# final_predictions = cat_model.predict(test_df_encoded)
+# final_predictions = ensemble.predict(test_df_encoded)
+final_predictions = predict_with_ensemble(ensemble, best_params["weights"], test_df_encoded)
 
 # Save predictions to CSV
 submission_df = pd.DataFrame({
