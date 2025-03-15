@@ -4,3 +4,5 @@ catboost_info
 venv
 
 rmse_record.py
+
+.DS_Store
